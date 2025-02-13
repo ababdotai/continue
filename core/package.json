@@ -9,7 +9,8 @@
     "tsc:check": "tsc -p ./ --noEmit",
     "build:npm": "tsc -p ./tsconfig.npm.json",
     "lint": "eslint . --ext ts",
-    "lint:fix": "eslint . --ext ts --fix"
+    "lint:fix": "eslint . --ext ts --fix",
+    "start_repo_agent": "tsx context/providers/RepoAgentImpl.ts"
   },
   "type": "module",
   "author": "Continue Dev, Inc",

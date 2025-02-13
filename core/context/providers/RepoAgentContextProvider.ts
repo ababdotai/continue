@@ -25,7 +25,7 @@ class RepoAgentContextProvider extends BaseContextProvider {
     extras: ContextProviderExtras,
   ): Promise<ContextItem[]> {
     try {
-      const agent = await initRepoAgent(extras.ide);
+      const agent = await initRepoAgent(extras.ide, extras.llm.title);
       const result = await agent.invoke(query);
 
       // Convert agent responses to context items
