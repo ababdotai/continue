@@ -29,6 +29,7 @@ import SearchContextProvider from "./SearchContextProvider";
 import TerminalContextProvider from "./TerminalContextProvider";
 import URLContextProvider from "./URLContextProvider";
 import WebContextProvider from "./WebContextProvider";
+import RepoAgentContextProvider from "./RepoAgentContextProvider.js";
 
 /**
  * Note: We are currently omitting the following providers due to bugs:
@@ -38,6 +39,7 @@ import WebContextProvider from "./WebContextProvider";
  * See this issue for details: https://github.com/continuedev/continue/issues/1365
  */
 export const Providers: (typeof BaseContextProvider)[] = [
+  RepoAgentContextProvider,
   DiffContextProvider,
   FileTreeContextProvider,
   GitHubIssuesContextProvider,

@@ -150,6 +150,12 @@
     },
     "commands": [
       {
+        "command": "continue.repoAgent",
+        "category": "Continue",
+        "title": "Repo Agent",
+        "group": "Continue"
+      },
+      {
         "command": "continue.applyCodeFromChat",
         "category": "Continue",
         "title": "Apply code from chat",
@@ -342,6 +348,11 @@
         "category": "Continue",
         "group": "Continue",
         "icon": "$(account)"
+      },
+      {
+        "command": "continue.repoAgent",
+        "title": "Continue: Ask Repo Agent",
+        "category": "Continue"
       }
     ],
     "keybindings": [
