@@ -1,36 +1,128 @@
-import { AIMessage, BaseMessage, HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
-import { ChatOllama } from "@langchain/ollama";
-import { ChatDeepSeek } from "@langchain/deepseek";
-import { ChatOpenAI } from "@langchain/openai";
 import { StateGraph } from "@langchain/langgraph";
 import { MemorySaver, Annotation, messagesStateReducer } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { ToolCall as LangChainToolCall } from "@langchain/core/messages/tool";
 import * as path from "node:path";
-import { IDE, ChatMessage } from "../../index.js";
+import { IDE, ChatMessage, Tool, ToolCall as ContinueToolCall } from "../../index.js";
 import { z } from "zod";
-import dotenv from "dotenv";
-import { fileURLToPath } from "url";
 import { ConfigHandler } from "../../config/ConfigHandler.js";
 import { ControlPlaneClient } from "../../control-plane/client.js";
 
-// Load environment variables from .env file
-dotenv.config();
+// System prompt template for the repository agent
+const systemPrompt = `You are a knowledgeable and helpful repository agent, designed to assist users in understanding and working with codebases.
 
-// Get environment variables
-const MODEL_PROVIDER = process.env.MODEL_PROVIDER || "continue";
-const MODEL_NAME = process.env.MODEL_NAME || "qwen2.5";
-const TEMPERATURE = parseFloat(process.env.TEMPERATURE || "0.7");
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || process.cwd();
-console.log("Workspace root:", WORKSPACE_ROOT);
-console.log("Using model provider:", MODEL_PROVIDER);
-console.log("Using model:", MODEL_NAME);
+WORKSPACE INFORMATION:
+- Your workspace root is: {{WORKSPACE_ROOT}}
+- All file paths should be relative to this workspace root
+- You have direct access to all files in this workspace
+- When using tools, always use relative paths (e.g., "src/main.ts" not "{{WORKSPACE_ROOT}}/src/main.ts")
+- Start exploring from the root directory using: <list_dir><dirpath>.</dirpath></list_dir>
 
-// Define the graph state
+ROLE:
+- You are an expert in code analysis, repository navigation, and code modification
+- You aim to provide accurate, detailed, and actionable responses
+- You maintain a professional and helpful demeanor
+- You MUST use the available tools to gather information before responding
+
+TOOL USE FORMATTING:
+Tool uses are formatted using XML-style tags. The tool name is enclosed in opening and closing tags, and each parameter is similarly enclosed within its own set of tags. Here's the structure:
+
+<tool_name>
+<parameter1_name>value1</parameter1_name>
+<parameter2_name>value2</parameter2_name>
+...
+</tool_name>
+
+For example:
+<search_code>
+<query>function handleError</query>
+</search_code>
+
+TOOL USAGE GUIDELINES:
+1. DO NOT repeat the same tool call with the same parameters
+2. If a search returns unexpected results, try different search terms or use a different tool
+3. When searching for files:
+   - Use list_dir first to understand the directory structure
+   - Use more specific search terms (e.g., "export class MyComponent" instead of just "MyComponent")
+   - For README files, try searching for "# Project Title" or similar markdown headers
+4. When a tool call doesn't give expected results:
+   - Analyze the results to understand why
+   - Try a different approach
+   - Use a combination of tools (e.g., list_dir + read_file)
+
+AVAILABLE TOOLS:
+1. search_code: Perform text-based search across the codebase to find relevant code snippets. The search is based on exact text matching, so use specific terms, function names, variable names, or code patterns that you expect to find in the code.
+   Examples:
+   <search_code>
+   <query>export class SearchContextProvider</query>
+   </search_code>
+   
+   <search_code>
+   <query>function getSearchResults</query>
+   </search_code>
+   
+   <search_code>
+   <query>export function handleError</query>
+   </search_code>
+   
+   <search_code>
+   <query># Project Title</query>
+   </search_code>
+
+2. read_file: Read the contents of specific files
+   Example:
+   <read_file>
+   <filepath>src/main.ts</filepath>
+   </read_file>
+
+3. edit_file: Modify or create files in the repository
+   Example:
+   <edit_file>
+   <filepath>src/utils.ts</filepath>
+   <content>// New file content here</content>
+   </edit_file>
+
+4. list_dir: List the contents of a directory
+   Example:
+   <list_dir>
+   <dirpath>.</dirpath>
+   </list_dir>
+
+5. get_problems: Get diagnostic problems for files
+   Example:
+   <get_problems>
+   <filepath>src/index.ts</filepath>
+   </get_problems>
+
+WORKFLOW GUIDELINES:
+1. Start with list_dir to understand the project structure
+2. When looking for project information:
+   - First list the root directory to find README and config files
+   - If not found, try searching for markdown headers or package definitions
+   - Use read_file on found files
+3. Never make assumptions without checking the code first
+4. Provide explanations based on actual code, not assumptions
+
+RESPONSE LANGUAGE:
+- Match your response language to the user's query language
+- Use English for code, comments, and technical terms
+- Maintain consistent formatting and clear structure
+
+IMPORTANT: 
+- You MUST actively and efficiently use the tools to gather information before responding
+- DO NOT repeat the same tool call if it didn't give expected results
+- If a tool call doesn't work as expected, try a different approach
+- Respond as quickly and concise as possible`;
+
+// Get workspace root from IDE interface
+async function getWorkspaceRoot(ide: IDE): Promise<string> {
+  const workspaceDirs = await ide.getWorkspaceDirs();
+  return workspaceDirs[0] || process.cwd();
+}
+
+// Define the graph state for managing conversation history
 const StateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
     reducer: messagesStateReducer,
@@ -38,7 +130,9 @@ const StateAnnotation = Annotation.Root({
 });
 
 // Create tools using the provided IDE instance
-function createTools(ide: IDE) {
+async function createTools(ide: IDE) {
+  const workspaceRoot = await getWorkspaceRoot(ide);
+
   const searchCodeTool = tool(async (args) => {
     const { query } = z.object({ query: z.string() }).parse(args);
     try {
@@ -50,15 +144,22 @@ function createTools(ide: IDE) {
   }, {
     name: "search_code",
     description: "Search for relevant code in the repository using semantic search.",
-    schema: z.object({
-      query: z.string().describe("The search query to find relevant code."),
-    }),
+    schema: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: {
+          type: "string",
+          description: "The search query to find relevant code."
+        }
+      }
+    }
   });
 
   const readFileTool = tool(async (args) => {
     const { filepath } = z.object({ filepath: z.string() }).parse(args);
     try {
-      const content = await ide.readFile(path.join(WORKSPACE_ROOT, filepath));
+      const content = await ide.readFile(path.join(workspaceRoot, filepath));
       return content;
     } catch (error: any) {
       return `Error reading file: ${error.message}`;
@@ -66,9 +167,16 @@ function createTools(ide: IDE) {
   }, {
     name: "read_file",
     description: "Read the contents of a file in the repository.",
-    schema: z.object({
-      filepath: z.string().describe("The relative path to the file from workspace root."),
-    }),
+    schema: {
+      type: "object",
+      required: ["filepath"],
+      properties: {
+        filepath: {
+          type: "string",
+          description: "The relative path to the file from workspace root."
+        }
+      }
+    }
   });
 
   const editFileTool = tool(async (args) => {
@@ -77,7 +185,7 @@ function createTools(ide: IDE) {
       content: z.string()
     }).parse(args);
     try {
-      await ide.writeFile(path.join(WORKSPACE_ROOT, filepath), content);
+      await ide.writeFile(path.join(workspaceRoot, filepath), content);
       return `Successfully edited file: ${filepath}`;
     } catch (error: any) {
       return `Error editing file: ${error.message}`;
@@ -85,16 +193,26 @@ function createTools(ide: IDE) {
   }, {
     name: "edit_file",
     description: "Edit or create a file in the repository.",
-    schema: z.object({
-      filepath: z.string().describe("The relative path to the file from workspace root."),
-      content: z.string().describe("The new content to write to the file."),
-    }),
+    schema: {
+      type: "object",
+      required: ["filepath", "content"],
+      properties: {
+        filepath: {
+          type: "string",
+          description: "The relative path to the file from workspace root."
+        },
+        content: {
+          type: "string",
+          description: "The new content to write to the file."
+        }
+      }
+    }
   });
 
   const listDirTool = tool(async (args) => {
     const { dirpath } = z.object({ dirpath: z.string() }).parse(args);
     try {
-      const entries = await ide.listDir(path.join(WORKSPACE_ROOT, dirpath));
+      const entries = await ide.listDir(path.join(workspaceRoot, dirpath));
       return JSON.stringify(entries.map(([name, type]) => ({
         name,
         type: type === 2 ? "directory" : "file"
@@ -105,9 +223,16 @@ function createTools(ide: IDE) {
   }, {
     name: "list_dir",
     description: "List the contents of a directory in the repository.",
-    schema: z.object({
-      dirpath: z.string().describe("The relative path to the directory from workspace root."),
-    }),
+    schema: {
+      type: "object",
+      required: ["dirpath"],
+      properties: {
+        dirpath: {
+          type: "string",
+          description: "The relative path to the directory from workspace root."
+        }
+      }
+    }
   });
 
   const getProblems = tool(async (args) => {
@@ -121,17 +246,22 @@ function createTools(ide: IDE) {
   }, {
     name: "get_problems",
     description: "Get diagnostic problems (errors, warnings) for a file.",
-    schema: z.object({
-      filepath: z.string().optional().describe("Optional file path to get problems for. If not provided, gets problems for the current file."),
-    }),
+    schema: {
+      type: "object",
+      properties: {
+        filepath: {
+          type: "string",
+          description: "Optional file path to get problems for. If not provided, gets problems for the current file."
+        }
+      }
+    }
   });
 
   return [searchCodeTool, readFileTool, editFileTool, listDirTool, getProblems];
 }
 
-// Create model instance based on provider
+// Create model instance with the provided tools and IDE
 async function createModel(tools: any[], ide: IDE, modelTitle?: string) {
-  let model;
   const ideSettings = {
     telemetryEnabled: false,
     remoteConfigServerUrl: "",
@@ -140,7 +270,7 @@ async function createModel(tools: any[], ide: IDE, modelTitle?: string) {
     pauseCodebaseIndexOnStart: false,
     pauseTabAutocompleteOnBattery: false,
     enableControlServerBeta: false,
-    continueTestEnvironment: "none" as "none" | "production" | "test" | "local",
+    continueTestEnvironment: "none" as "none" | "production" | "local" | "staging",
   };
 
   const configHandler = new ConfigHandler(
@@ -153,120 +283,196 @@ async function createModel(tools: any[], ide: IDE, modelTitle?: string) {
     )
   );
 
-  if (MODEL_PROVIDER === "continue") {
-    // 使用传入的模型标题或默认值
-    const title = modelTitle || process.env.CONTINUE_MODEL_TITLE;
-    if (!title) {
-      throw new Error("Model title is required for Continue provider");
-    }
-    const llm = await configHandler.llmFromTitle(title);
-    
-    // 适配 Continue 的模型接口到 LangChain 的接口
-    model = {
-      invoke: async (messages: BaseMessage[]) => {
-        try {
-          if (!messages || messages.length === 0) {
-            throw new Error("At least one message is required");
-          }
-
-          // 将 BaseMessage[] 转换为 ChatMessage[]
-          const chatMessages: ChatMessage[] = messages.map(msg => {
-            const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-            if (!content) {
-              throw new Error("Message content cannot be empty");
-            }
-            if (msg instanceof SystemMessage) {
-              return { role: "system", content };
-            } else if (msg instanceof HumanMessage) {
-              return { role: "user", content };
-            } else if (msg instanceof AIMessage) {
-              return { role: "assistant", content };
-            } else {
-              throw new Error(`Unsupported message type: ${msg.constructor.name}`);
-            }
-          });
-
-          console.log("Sending chat messages to model:", chatMessages);
-          
-          // 使用 chat 方法而不是 invoke
-          const response = await llm.chat(chatMessages, new AbortController().signal);
-          if (!response || !response.content) {
-            throw new Error("Empty response from model");
-          }
-          
-          const responseContent = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
-          return new AIMessage({ content: responseContent });
-        } catch (error) {
-          console.error("Error in model.invoke:", error);
-          throw error;
-        }
-      },
-      // 添加其他必要的方法
-      streamChat: llm.streamChat?.bind(llm),
-      streamComplete: llm.streamComplete?.bind(llm),
-      complete: llm.complete?.bind(llm),
-    };
-  } else {
-    // 使用环境变量配置的模型
-    switch (MODEL_PROVIDER) {
-      case "ollama":
-        model = new ChatOllama({
-          baseUrl: OLLAMA_BASE_URL,
-          model: MODEL_NAME,
-          temperature: TEMPERATURE,
-        });
-        break;
-      case "deepseek":
-        if (!DEEPSEEK_API_KEY) {
-          throw new Error("DEEPSEEK_API_KEY is required for DeepSeek provider");
-        }
-        model = new ChatDeepSeek({
-          apiKey: DEEPSEEK_API_KEY,
-          model: MODEL_NAME,
-          temperature: TEMPERATURE,
-        });
-        break;
-      case "openai":
-        if (!OPENAI_API_KEY) {
-          throw new Error("OPENAI_API_KEY is required for OpenAI provider");
-        }
-        model = new ChatOpenAI({
-          configuration: {
-            apiKey: OPENAI_API_KEY,
-            baseURL: OPENAI_BASE_URL,
-          },
-          openAIApiKey: OPENAI_API_KEY,
-          model: MODEL_NAME,
-          temperature: TEMPERATURE,
-        });
-        break;
-      default:
-        throw new Error(`Unsupported model provider: ${MODEL_PROVIDER}`);
-    }
+  // Use provided model title or fallback to environment variable
+  const title = modelTitle || process.env.CONTINUE_MODEL_TITLE;
+  if (!title) {
+    throw new Error("Model title is required for Continue provider");
   }
-  return model;
+  const llm = await configHandler.llmFromTitle(title);
+  
+  // Adapt Continue model interface to LangChain interface
+  return {
+    invoke: async (messages: BaseMessage[]) => {
+      try {
+        if (!messages || messages.length === 0) {
+          throw new Error("At least one message is required");
+        }
+
+        // Convert BaseMessage[] to ChatMessage[]
+        const chatMessages: ChatMessage[] = messages.map(msg => {
+          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+          if (!content) {
+            throw new Error("Message content cannot be empty");
+          }
+          if (msg instanceof SystemMessage) {
+            return { role: "system", content };
+          } else if (msg instanceof HumanMessage) {
+            return { role: "user", content };
+          } else if (msg instanceof AIMessage) {
+            return { role: "assistant", content, tool_calls: msg.tool_calls };
+          } else if (msg instanceof ToolMessage) {
+            return { role: "tool", content, toolCallId: msg.tool_call_id };
+          } else {
+            throw new Error(`Unsupported message type: ${msg.constructor.name}`);
+          }
+        });
+
+        console.log("Sending chat messages to model:", chatMessages);
+        
+        // Use chat method instead of invoke
+        const response = await llm.chat(chatMessages, new AbortController().signal, {
+          tools: tools.map(t => ({
+            type: "function" as const,
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: {
+                type: "object",
+                properties: t.schema.shape,
+                required: Object.keys(t.schema.shape)
+              }
+            },
+            displayTitle: t.name,
+            wouldLikeTo: `I would like to ${t.description}`,
+            readonly: false
+          } as Tool))
+        });
+
+        if (!response) {
+          throw new Error("Empty response from model");
+        }
+
+        // Process response content
+        let content = "";
+        let toolCalls: ContinueToolCall[] | undefined;
+
+        // First check for native tool calls
+        if ('tool_calls' in response && Array.isArray(response.tool_calls)) {
+          toolCalls = response.tool_calls.map(call => convertLangChainToolCallToContinue(call as LangChainToolCall));
+        }
+
+        // If there's response content, try to parse XML tool calls
+        if (response.content) {
+          content = typeof response.content === "string" ? 
+            response.content : 
+            JSON.stringify(response.content);
+
+          if (!toolCalls) {
+            const xmlToolCalls = parseToolCalls(content);
+            if (xmlToolCalls.length > 0) {
+              toolCalls = convertToToolCalls(xmlToolCalls);
+            }
+          }
+        }
+
+        // Ensure response has either content or tool calls
+        if (!content && !toolCalls) {
+          throw new Error("Response must contain either content or tool calls");
+        }
+        
+        return new AIMessage({ 
+          content,
+          tool_calls: toolCalls ? toolCalls.map(convertContinueToolCallToLangChain) : undefined
+        });
+      } catch (error) {
+        console.error("Error in model.invoke:", error);
+        throw error;
+      }
+    }
+  };
 }
 
-// Define the function that determines whether to continue or not
+// Helper function to parse XML tool calls from model response
+function parseToolCalls(content: string): { toolName: string; params: Record<string, string> }[] {
+  const toolCalls: { toolName: string; params: Record<string, string> }[] = [];
+  
+  // Match tool call blocks
+  const toolBlockRegex = /<(\w+)>([\s\S]*?)<\/\1>/g;
+  const toolMatches = content.matchAll(toolBlockRegex);
+  
+  for (const match of toolMatches) {
+    const toolName = match[1];
+    const paramsContent = match[2];
+    
+    // Match parameter blocks within tool call
+    const paramRegex = /<(\w+)>([\s\S]*?)<\/\1>/g;
+    const paramMatches = paramsContent.matchAll(paramRegex);
+    
+    const params: Record<string, string> = {};
+    for (const paramMatch of paramMatches) {
+      params[paramMatch[1]] = paramMatch[2].trim();
+    }
+    
+    toolCalls.push({ toolName, params });
+  }
+  
+  return toolCalls;
+}
+
+// Convert Continue ToolCall to LangChain ToolCall format
+function convertContinueToolCallToLangChain(call: ContinueToolCall): LangChainToolCall {
+  return {
+    id: call.id || `call_${Date.now()}`,
+    type: "tool_call",
+    name: call.function.name,
+    args: JSON.parse(call.function.arguments)
+  };
+}
+
+// Convert LangChain ToolCall to Continue ToolCall format
+function convertLangChainToolCallToContinue(call: LangChainToolCall): ContinueToolCall {
+  return {
+    id: call.id || `call_${Date.now()}`,
+    type: "function",
+    function: {
+      name: call.name,
+      arguments: JSON.stringify(call.args)
+    }
+  };
+}
+
+// Convert XML tool calls to Continue ToolCall format
+function convertToToolCalls(xmlToolCalls: { toolName: string; params: Record<string, string> }[]): ContinueToolCall[] {
+  return xmlToolCalls.map((call, index) => ({
+    id: `call_${index}`,
+    type: "function",
+    function: {
+      name: call.toolName,
+      arguments: JSON.stringify(call.params)
+    }
+  }));
+}
+
+// Determine whether to continue processing based on message content
 function shouldContinue(state: typeof StateAnnotation.State) {
   const messages = state.messages;
-  const lastMessage = messages[messages.length - 1] as AIMessage;
-
-  // Check if the last message has tool calls
-  if (lastMessage.tool_calls && lastMessage.tool_calls.length > 0) {
-    return "tools";
-  }
+  if (messages.length === 0) return "__end__";
   
-  // If no tool calls and it's an AI message, end the conversation
+  const lastMessage = messages[messages.length - 1];
+  
   if (lastMessage instanceof AIMessage) {
-    return "__end__";
+    // Check for tool calls
+    if (lastMessage.tool_calls?.length) {
+      return "tools";
+    }
+    
+    // Check for XML format tool calls
+    const content = lastMessage.content as string;
+    if (content) {
+      const xmlToolCalls = parseToolCalls(content);
+      if (xmlToolCalls.length > 0) {
+        // Convert to LangChain format and update message
+        const continueToolCalls = convertToToolCalls(xmlToolCalls);
+        lastMessage.tool_calls = continueToolCalls.map(convertContinueToolCallToLangChain);
+        return "tools";
+      }
+    }
   }
   
-  // If it's a human message, continue to agent
-  return "agent";
+  return "__end__";
 }
 
-// Define the function that calls the model
+// Define the function that calls the model and processes responses
 function createCallModel(model: any) {
   return async function callModel(state: typeof StateAnnotation.State) {
     const messages = state.messages;
@@ -275,10 +481,12 @@ function createCallModel(model: any) {
         throw new Error("At least one message is required");
       }
 
-      // 确保消息内容不为空
+      // Filter out empty messages but keep tool-related messages
       const validMessages = messages.filter(msg => {
-        const content = msg.content;
-        return content !== undefined && content !== null && content !== "";
+        if (msg instanceof AIMessage && msg.tool_calls?.length) {
+          return true;
+        }
+        return msg.content !== undefined && msg.content !== null && msg.content !== "";
       });
 
       if (validMessages.length === 0) {
@@ -287,16 +495,36 @@ function createCallModel(model: any) {
 
       console.log("Sending messages to model:", validMessages.map(m => ({
         type: m.constructor.name,
-        content: m.content
+        content: m.content,
+        tool_calls: m instanceof AIMessage ? m.tool_calls : undefined
       })));
 
       const response = await model.invoke(validMessages);
       
-      if (!response || !response.content) {
+      if (!response) {
         throw new Error("Empty response from model");
       }
 
-      return { messages: [response] };
+      // Parse tool calls from response
+      const content = response.content || "";
+      const xmlToolCalls = parseToolCalls(content);
+      
+      if (xmlToolCalls.length > 0) {
+        // Convert to Continue format
+        const continueToolCalls = convertToToolCalls(xmlToolCalls);
+        
+        // Create a new message with original content and tool calls
+        const toolCallMessage = new AIMessage({
+          content: content,
+          tool_calls: continueToolCalls.map(convertContinueToolCallToLangChain)
+        });
+
+        // Return message with tool calls
+        return { messages: [...state.messages, toolCallMessage] };
+      }
+
+      // If no tool calls, return original response
+      return { messages: [...state.messages, response] };
     } catch (error) {
       console.error("Error in callModel:", error);
       throw error;
@@ -304,113 +532,15 @@ function createCallModel(model: any) {
   };
 }
 
-// Define the system prompt
-const systemPrompt = `You are a knowledgeable and helpful repository agent, designed to assist users in understanding and working with codebases.
-
-ROLE:
-- You are an expert in code analysis, repository navigation, and code modification
-- You aim to provide accurate, detailed, and actionable responses
-- You maintain a professional and helpful demeanor
-- You MUST use the available tools to gather information before responding
-
-AVAILABLE TOOLS:
-1. search_code: Search for relevant code snippets using semantic search
-   - Use this tool to find relevant code sections when answering questions
-   - ALWAYS use this as your first step to understand the codebase
-
-2. read_file: Read the contents of specific files
-   - Use this after finding relevant files through search_code
-   - Read files to understand implementation details
-
-3. edit_file: Modify or create files in the repository
-   - Use this only when explicitly asked to make changes
-   - Always verify changes before applying
-
-4. list_dir: List the contents of a directory
-   - Use this to explore the repository structure
-   - Helps in finding relevant files and directories
-
-5. get_problems: Get diagnostic problems for files
-   - Use this to check for errors and warnings
-   - Helps in identifying issues that need attention
-
-WORKFLOW GUIDELINES:
-1. ALWAYS start by using search_code to find relevant information
-2. Use list_dir to explore directories when needed
-3. Use read_file to examine files found through search or directory listing
-4. Never make assumptions without checking the code first
-5. Provide explanations based on actual code, not assumptions
-6. When asked about the project:
-   - Search for README files
-   - Look for package.json or similar config files
-   - Search for main entry points
-   - Examine project structure using list_dir
-
-RESPONSE LANGUAGE:
-- Match your response language to the user's query language
-- Use English for code, comments, and technical terms
-- Maintain consistent formatting and clear structure
-
-IMPORTANT: You MUST actively and efficiently use the tools to gather information before responding. Do not make assumptions or ask questions without first attempting to find the answers using the available tools. Respond as quickly and concise as possible.`;
-
-// Function to initialize the repo agent
-export async function initRepoAgent(ide: IDE, modelTitle?: string) {
-  const tools = createTools(ide);
-  const toolNode = new ToolNode(tools);
-  const model = await createModel(tools, ide, modelTitle);
-  const callModel = createCallModel(model);
-
-  // Define the graph
-  const workflow = new StateGraph(StateAnnotation)
-    .addNode("agent", callModel)
-    .addNode("tools", toolNode)
-    .addEdge("__start__", "agent")
-    .addConditionalEdges("agent", shouldContinue)
-    .addEdge("tools", "agent");
-
-  // Initialize memory
-  const checkpointer = new MemorySaver();
-
-  // Compile the graph
-  const app = workflow.compile({ checkpointer });
-
-  return {
-    async invoke(input: string) {
-      console.log("Starting conversation...");
-      
-      const finalState = await app.invoke(
-        {
-          messages: [
-            new SystemMessage(systemPrompt),
-            new HumanMessage(input),
-          ],
-        },
-        { configurable: { thread_id: "repo-agent-1" } }
-      );
-
-      // Log all messages for debugging
-      console.log("\nConversation history:");
-      finalState.messages.forEach((msg, i) => {
-        console.log(`\nMessage ${i + 1}:`);
-        console.log("Type:", msg.constructor.name);
-        console.log("Content:", msg.content);
-        if (msg instanceof AIMessage) {
-          console.log("Additional kwargs:", JSON.stringify(msg.additional_kwargs, null, 2));
-          if (msg.content === "{}") {
-            console.warn("Warning: Empty response from model!");
-          }
-        }
-      });
-
-      return finalState;
-    }
-  };
-}
-
-// Add message handler for VSCode extension
+// Handle repository agent messages from VSCode extension
 export async function handleRepoAgentMessage(message: { type: string; payload: any }, ide: IDE) {
   if (message.type === "INVOKE_REPO_AGENT") {
     try {
+      console.log("Received user input:", message.payload.input);
+      if (!message.payload.input || typeof message.payload.input !== "string") {
+        throw new Error("Invalid input: input must be a non-empty string");
+      }
+      
       const agent = await initRepoAgent(ide);
       const result = await agent.invoke(message.payload.input);
       return {
@@ -420,6 +550,7 @@ export async function handleRepoAgentMessage(message: { type: string; payload: a
         }
       };
     } catch (error: any) {
+      console.error("Repository Agent error:", error);
       return {
         type: "REPO_AGENT_ERROR",
         payload: {
@@ -431,232 +562,62 @@ export async function handleRepoAgentMessage(message: { type: string; payload: a
   return null;
 }
 
-// Add main method for testing
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  // Create a simple IDE implementation for testing
-  const testIde = {
-    async getSearchResults(query: string) {
-      console.log("Searching for:", query);
-      return "Test search results";
-    },
-    async readFile(filepath: string) {
-      console.log("Reading file:", filepath);
-      return "Test file contents";
-    },
-    async writeFile(filepath: string, content: string) {
-      console.log("Writing to file:", filepath);
-      console.log("Content:", content);
-      return;
-    },
-    async listDir(dirpath: string) {
-      console.log("Listing directory:", dirpath);
-      return [["test.ts", 1], ["test_dir", 2]];
-    },
-    async getProblems(filepath?: string) {
-      console.log("Getting problems for:", filepath);
-      return [];
-    },
-    async getIdeInfo() {
-      return { name: "test", version: "1.0.0" };
-    },
-    async getIdeSettings() {
-      return {
-        telemetryEnabled: false,
-        remoteConfigServerUrl: null,
-        userToken: null,
-        remoteConfigSyncPeriod: 60,
-        pauseCodebaseIndexOnStart: false,
-        pauseTabAutocompleteOnBattery: false,
-      };
-    },
-    async getDiff() {
-      return "";
-    },
-    async getClipboardContent() {
-      return "";
-    },
-    async getWorkspaceDirs() {
-      return [process.cwd()];
-    },
-    async getWorkspaceRoot() {
-      return process.cwd();
-    },
-    async showQuickPick() {
-      return null;
-    },
-    async showInputBox() {
-      return null;
-    },
-    async showToast() {
-      return null;
-    },
-    async showWarning() {
-      return null;
-    },
-    async showError() {
-      return null;
-    },
-    async openFile() {},
-    async openLink() {},
-    async openDiff() {},
-    async openSettings() {},
-    async openFolder() {},
-    async getHighlightedCode() {
-      return "";
-    },
-    async getActiveTextEditor() {
-      return null;
-    },
-    async getVisibleTextEditors() {
-      return [];
-    },
-    async getLanguageId() {
-      return "typescript";
-    },
-    async getFileType() {
-      return "file";
-    },
-    async getTerminalText() {
-      return "";
-    },
-    async getTerminalCommand() {
-      return "";
-    },
-    async getTerminalCwd() {
-      return process.cwd();
-    },
-    async getTerminalEnv() {
-      return {};
-    },
-    async getTerminalPid() {
-      return -1;
-    },
-    async getTerminalProcessName() {
-      return "";
-    },
-    async getTerminalSelection() {
-      return "";
-    },
-    async getTerminalShell() {
-      return "";
-    },
-    async getConfig() {
-      return {};
-    },
-    async getGlobalState() {
-      return {};
-    },
-    async setGlobalState() {},
-    async clearGlobalState() {},
-    async isTelemetryEnabled() {
-      return false;
-    },
-    async getUniqueId() {
-      return "test-id";
-    },
-    async getTerminalContents() {
-      return "";
-    },
-    async getDebugLocals() {
-      return [];
-    },
-    async getDebugStack() {
-      return [];
-    },
-    async getDebugBreakpoints() {
-      return [];
-    },
-    async getDebugVariables() {
-      return [];
-    },
-    async getDebugWatches() {
-      return [];
-    },
-    async getDebugExpressions() {
-      return [];
-    },
-    async getDebugConsole() {
-      return "";
-    },
-    async getDebugOutput() {
-      return "";
-    },
-    async getDebugRepl() {
-      return "";
-    },
-    async getDebugSessions() {
-      return [];
-    },
-    async getDebugThreads() {
-      return [];
-    },
-    async getDebugFrames() {
-      return [];
-    },
-    async getDebugScopes() {
-      return [];
-    },
-    async getDebugSources() {
-      return [];
-    },
-    async getDebugModules() {
-      return [];
-    },
-    async getDebugLoadedSources() {
-      return [];
-    },
-    async getDebugProcesses() {
-      return [];
-    },
-    async getDebugStartupSessions() {
-      return [];
-    },
-    async getDebugAdapterExecutable() {
-      return null;
-    },
-    async getDebugAdapterDescriptor() {
-      return null;
-    },
-    async getDebugConfiguration() {
-      return null;
-    },
-  } as unknown as IDE;
+// Initialize repository agent with IDE instance and optional model title
+export async function initRepoAgent(ide: IDE, modelTitle?: string) {
+  const workspaceRoot = await getWorkspaceRoot(ide);
+  console.log("Workspace root:", workspaceRoot);
 
-  async function main() {
-    try {
-      console.log("初始化 Repository Agent...");
-      const agent = await initRepoAgent(testIde);
+  const tools = await createTools(ide);
+  const toolNode = new ToolNode(tools);
+  const model = await createModel(tools, ide, modelTitle);
+  const callModel = createCallModel(model);
+
+  // Define the graph for managing conversation flow
+  const workflow = new StateGraph(StateAnnotation)
+    .addNode("agent", callModel)
+    .addNode("tools", toolNode)
+    .addEdge("__start__", "agent")
+    .addConditionalEdges("agent", shouldContinue)
+    .addEdge("tools", "agent");
+
+  // Initialize memory for conversation state
+  const checkpointer = new MemorySaver();
+
+  // Compile the graph
+  const app = workflow.compile({ checkpointer });
+
+  return {
+    async invoke(input: string) {
+      console.log("Starting conversation with input:", input);
       
-      // 测试查询
-      const testQueries = [
-        "这个项目的主要功能是什么？",
-        "列出所有的源代码文件",
-        "搜索包含'error'的代码",
+      if (!input || typeof input !== "string") {
+        throw new Error("Invalid input: input must be a non-empty string");
+      }
+
+      const messages = [
+        new SystemMessage(systemPrompt.replace(/\${{WORKSPACE_ROOT}}/g, workspaceRoot)),
+        new HumanMessage(input)
       ];
 
-      for (const query of testQueries) {
-        console.log("\n执行查询:", query);
-        console.log("----------------------------------------");
-        const result = await agent.invoke(query);
-        console.log("\n回复:");
-        result.messages
-          .filter(msg => msg instanceof AIMessage)
-          .forEach(msg => {
-            console.log(msg.content);
-            if (msg instanceof AIMessage && msg.tool_calls) {
-              console.log("\n使用的工具:");
-              msg.tool_calls.forEach((call: any) => {
-                console.log(`- ${call.function.name}(${call.function.arguments})`);
-              });
-            }
-          });
-        console.log("----------------------------------------\n");
-      }
-    } catch (error) {
-      console.error("测试过程中出现错误:", error);
-    }
-  }
+      console.log("Initial messages:", messages.map(m => ({
+        type: m.constructor.name,
+        content: m.content
+      })));
+      
+      const finalState = await app.invoke(
+        { messages },
+        { configurable: { thread_id: "repo-agent-1" } }
+      ) as typeof StateAnnotation.State;
 
-  // 运行测试
-  main().catch(console.error);
-} 
+      // Log conversation history for debugging
+      console.log("\nConversation history:");
+      finalState.messages.forEach((msg, i) => {
+        console.log(`Message ${i + 1}:`);
+        console.log("Type:", msg.constructor.name);
+        console.log("Content:", msg.content);
+      });
+
+      return finalState;
+    }
+  };
+}
