@@ -150,12 +150,6 @@
     },
     "commands": [
       {
-        "command": "continue.repoAgent",
-        "category": "Continue",
-        "title": "Repo Agent",
-        "group": "Continue"
-      },
-      {
         "command": "continue.applyCodeFromChat",
         "category": "Continue",
         "title": "Apply code from chat",
